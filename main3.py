@@ -1,107 +1,108 @@
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.decomposition import PCA
 import backtrader as bt
 
 
-file_name = "market_data2.xlsx"
-excel_data = pd.ExcelFile(file_name)
+file_name = "market_data2.xlsx"  # Nazwa pliku Excela
 
 
-data_frames = {sheet: excel_data.parse(sheet) for sheet in excel_data.sheet_names}
-print("Dostępne arkusze:", excel_data.sheet_names)
+def load_excel_data(file_name):
+    excel_data = pd.ExcelFile(file_name)
+    data_frames = {sheet: excel_data.parse(sheet) for sheet in excel_data.sheet_names}
+    print("Dostępne arkusze:", excel_data.sheet_names)
+    return data_frames
+
+data_frames = load_excel_data(file_name)
 
 
-def prepare_data(df):
+def prepare_backtest_data(df):
     df = df.copy()
-
-
-    if 'Datetime' in df.columns:
-        df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')
-
-
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-
-
-    def calculate_rsi(series, period=14):
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    df['RSI_14'] = calculate_rsi(df['Close'])
-
-
-    bb_period = 20
-    df['BB_Middle'] = df['Close'].rolling(window=bb_period).mean()
-    df['BB_Upper'] = df['BB_Middle'] + 2 * df['Close'].rolling(window=bb_period).std()
-    df['BB_Lower'] = df['BB_Middle'] - 2 * df['Close'].rolling(window=bb_period).std()
-
-
-    df = df.dropna()
-
-
-    df['Signal'] = (df['Close'] > df['SMA_50']).astype(int)
-
+    df['datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')  # Konwersja daty
+    df.set_index('datetime', inplace=True)
+    df = df[['Open', 'High', 'Low', 'Close']].dropna()  # Wybór wymaganych kolumn
     return df
 
-
-prepared_data = {sheet: prepare_data(df) for sheet, df in data_frames.items()}
-
-
-analysis_results = {}
-
-for sheet, df in prepared_data.items():
-    print(f"Analiza dla arkusza: {sheet}")
+prepared_data = {sheet: prepare_backtest_data(df) for sheet, df in data_frames.items()}
 
 
-    X = df[['SMA_50', 'SMA_200', 'RSI_14', 'BB_Middle', 'BB_Upper', 'BB_Lower']]
-    y = df['Signal']
 
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+import pandas as pd
+import backtrader as bt
 
 
-    model = LogisticRegression(max_iter=500)
-    model.fit(X_train, y_train)
-
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    analysis_results[sheet] = accuracy
-
-
-    pca = PCA(n_components=2)
-    X_reduced = pca.fit_transform(X)
-    model.fit(X_reduced, y)
-
-
-    xx, yy = np.meshgrid(
-        np.linspace(X_reduced[:, 0].min(), X_reduced[:, 0].max(), 100),
-        np.linspace(X_reduced[:, 1].min(), X_reduced[:, 1].max(), 100)
+class RSI_SMAStrategy(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+        ("rsi_overbought", 65),
+        ("rsi_oversold", 30),
+        ("sma_period", 40),
     )
-    Z = model.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.params.rsi_period)
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.sma_period)
+
+    def next(self):
+        # Kupno, gdy RSI jest poniżej progu wyprzedania i cena powyżej SMA
+        if self.rsi < self.params.rsi_oversold and self.data.close > self.sma:
+            self.buy()
+        # Sprzedaż, gdy RSI przekracza próg wykupienia
+        elif self.rsi > self.params.rsi_overbought:
+            self.sell()
 
 
-    plt.contourf(xx, yy, Z, alpha=0.75, cmap=plt.cm.RdYlBu)
-    plt.scatter(X_reduced[:, 0], X_reduced[:, 1], c=y, edgecolors='k', marker='o', cmap=plt.cm.RdYlBu, s=50)
-    plt.title(f"Granica decyzyjna - {sheet}")
-    plt.xlabel("Główna składowa 1")
-    plt.ylabel("Główna składowa 2")
-    plt.colorbar(label='Sygnał (0 = Sprzedaż, 1 = Kupno)')
-    plt.show()
+
+def run_backtest(datafile, initial_cash=10000):
+    
+    if datafile.endswith('.xlsx'):
+        data = pd.read_excel(datafile, parse_dates=True)
+    else:
+        raise ValueError("Obsługiwane są tylko pliki Excel (.xlsx).")
+
+    
+    if 'Datetime' in data.columns:
+        data['Datetime'] = pd.to_datetime(data['Datetime'])
+        data.set_index('Datetime', inplace=True)
+    else:
+        raise ValueError("Plik musi zawierać kolumnę 'Datetime'.")
+
+    
+    required_columns = {'Open', 'High', 'Low', 'Close', 'Volume'}
+    if not required_columns.issubset(data.columns):
+        raise ValueError(f"Plik musi zawierać kolumny: {required_columns}")
+
+    
+    cerebro = bt.Cerebro()
+    cerebro.broker.set_cash(initial_cash)
+
+    
+    cerebro.broker.setcommission(commission=0.001)  # 0.1% prowizji
+    cerebro.broker.set_slippage_perc(0.002)         # 0.2% poślizgu
+
+    
+    data_feed = bt.feeds.PandasData(dataname=data)
+    cerebro.adddata(data_feed)
+
+    
+    cerebro.addstrategy(RSI_SMAStrategy)
+
+    
+    print(f"[INFO] Kapitał początkowy: {cerebro.broker.getvalue():.2f}")
+    result = cerebro.run()
+    print(f"[INFO] Końcowa wartość portfela: {cerebro.broker.getvalue():.2f}")
+
+    
+    cerebro.plot()
 
 
-print("Dokładności modelu dla każdego arkusza:")
-for sheet, acc in analysis_results.items():
-    print(f"{sheet}: {acc:.2f}")
 
-
+if __name__ == "__main__":
+    try:
+        # Podaj nazwę pliku Excel
+        datafile = "market_data2.xlsx"
+        # Uruchom backtest
+        run_backtest(datafile)
+    except Exception as e:
+        print(f"[ERROR] {e}")
