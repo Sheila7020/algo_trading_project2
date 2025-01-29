@@ -1,108 +1,120 @@
+import backtrader as bt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import backtrader as bt
+import warnings
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+warnings.simplefilter(action='ignore', category=UserWarning)
 
 
-file_name = "market_data2.xlsx"  # Nazwa pliku Excela
-
-
-def load_excel_data(file_name):
-    excel_data = pd.ExcelFile(file_name)
-    data_frames = {sheet: excel_data.parse(sheet) for sheet in excel_data.sheet_names}
-    print("Dostępne arkusze:", excel_data.sheet_names)
-    return data_frames
-
-data_frames = load_excel_data(file_name)
-
-
-def prepare_backtest_data(df):
-    df = df.copy()
-    df['datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')  # Konwersja daty
-    df.set_index('datetime', inplace=True)
-    df = df[['Open', 'High', 'Low', 'Close']].dropna()  # Wybór wymaganych kolumn
-    return df
-
-prepared_data = {sheet: prepare_backtest_data(df) for sheet, df in data_frames.items()}
-
-
-
-
-import pandas as pd
-import backtrader as bt
-
-
-class RSI_SMAStrategy(bt.Strategy):
-    params = (
-        ("rsi_period", 14),
-        ("rsi_overbought", 65),
-        ("rsi_oversold", 30),
-        ("sma_period", 40),
+class MachineLearningStrategy(bt.Strategy):
+    params = dict(
+        rsi_period=14,
+        macd_short=12,
+        macd_long=26,
+        macd_signal=9,
+        atr_period=14,
+        capital_per_trade=0.1,
+        max_positions=10,
+        risk_free_rate=0.03,
+        stop_loss=0.02,
+        take_profit=0.05
     )
 
     def __init__(self):
-        self.rsi = bt.indicators.RSI(self.data.close, period=self.params.rsi_period)
-        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.sma_period)
+        self.rsi = bt.indicators.RSI(period=self.params.rsi_period)
+        self.macd = bt.indicators.MACD(period_me1=self.params.macd_short,
+                                       period_me2=self.params.macd_long,
+                                       period_signal=self.params.macd_signal)
+        self.atr = bt.indicators.ATR(period=self.params.atr_period)
+        self.clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.scaler = StandardScaler()
+        self.train_model()
+        self.returns = []
+        self.equity_curve = []
+        self.wins = 0
+        self.losses = 0
+        self.initial_cash = None
+        self.entry_prices = {}
+
+    def train_model(self):
+        df = pd.read_csv(file_path, index_col='Date', parse_dates=True)
+        df.rename(columns={'Max': 'High', 'Min': 'Low'}, inplace=True)
+        df['rsi'] = df['Close'].rolling(self.params.rsi_period).apply(
+            lambda x: (100 - (100 / (1 + (x.mean() / (x.std() + 1e-5))))))
+        df['macd'] = df['Close'].ewm(span=self.params.macd_short).mean() - df['Close'].ewm(
+            span=self.params.macd_long).mean()
+        df['atr'] = df['High'] - df['Low']
+        df.dropna(inplace=True)
+        df['target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, 0)
+        features = df[['rsi', 'macd', 'atr']]
+        target = df['target']
+        features_scaled = self.scaler.fit_transform(features)
+        self.clf.fit(features_scaled, target)
 
     def next(self):
-        # Kupno, gdy RSI jest poniżej progu wyprzedania i cena powyżej SMA
-        if self.rsi < self.params.rsi_oversold and self.data.close > self.sma:
-            self.buy()
-        # Sprzedaż, gdy RSI przekracza próg wykupienia
-        elif self.rsi > self.params.rsi_overbought:
-            self.sell()
+        if self.initial_cash is None:
+            self.initial_cash = self.broker.get_cash()
+
+        cash = self.broker.get_cash()
+        price = self.data.close[0]
+        size = max(1, int((cash * self.params.capital_per_trade) / price))
+
+        if len(self.broker.positions) >= self.params.max_positions or cash < price:
+            return
+
+        features = np.array([[self.rsi[0], self.macd.macd[0], self.atr[0]]])
+        features_scaled = self.scaler.transform(features)
+        prediction = self.clf.predict(features_scaled)
+
+        if not self.position:
+            if prediction == 1:
+                self.buy(size=size)
+                self.entry_prices[self.data] = price
+            else:
+                self.sell(size=size)
+                self.entry_prices[self.data] = price
+
+        if self.position:
+            entry_price = self.entry_prices.get(self.data, price)
+            if price <= entry_price * (1 - self.params.stop_loss) or price >= entry_price * (
+                    1 + self.params.take_profit):
+                self.close()
+                self.wins += int(price > entry_price)
+                self.losses += int(price < entry_price)
+
+        self.equity_curve.append(self.broker.get_value())
+        if len(self.equity_curve) > 1:
+            self.returns.append((self.equity_curve[-1] / self.equity_curve[-2]) - 1)
+
+    def stop(self):
+        returns_array = np.array(self.returns)
+        sharpe_ratio = ((np.nanmean(returns_array) - (self.params.risk_free_rate / 252)) /
+                        np.nanstd(returns_array)) * np.sqrt(252) if len(returns_array) > 1 else 0.0
+        running_max = np.maximum.accumulate(self.equity_curve)
+        max_drawdown = np.min((self.equity_curve - running_max) / running_max) if len(self.equity_curve) > 1 else 0.0
+        total_return = (self.broker.get_value() - self.initial_cash) / self.initial_cash * 100
+        win_rate = (self.wins / (self.wins + self.losses)) * 100 if (self.wins + self.losses) > 0 else 0.0
+
+        print(f'Sharpe Ratio: {sharpe_ratio:.4f}')
+        print(f'Max Drawdown: {max_drawdown:.4f}')
+        print(f'Total Return: {total_return:.2f}%')
+        print(f'Win Rate: {win_rate:.2f}%')
 
 
+file_path = "path"
+data = pd.read_csv(file_path, index_col='Date', parse_dates=True)
+data.rename(columns={'Max': 'High', 'Min': 'Low'}, inplace=True)
+bt_data = bt.feeds.PandasData(dataname=data)
 
-def run_backtest(datafile, initial_cash=10000):
-    
-    if datafile.endswith('.xlsx'):
-        data = pd.read_excel(datafile, parse_dates=True)
-    else:
-        raise ValueError("Obsługiwane są tylko pliki Excel (.xlsx).")
+cerebro = bt.Cerebro()
+cerebro.addstrategy(MachineLearningStrategy)
+cerebro.adddata(bt_data)
+cerebro.broker.set_cash(10000)
+cerebro.broker.setcommission(commission=0.004)
+cerebro.broker.set_slippage_fixed(0.002)
+cerebro.addsizer(bt.sizers.FixedSize, stake=1)
 
-    
-    if 'Datetime' in data.columns:
-        data['Datetime'] = pd.to_datetime(data['Datetime'])
-        data.set_index('Datetime', inplace=True)
-    else:
-        raise ValueError("Plik musi zawierać kolumnę 'Datetime'.")
-
-    
-    required_columns = {'Open', 'High', 'Low', 'Close', 'Volume'}
-    if not required_columns.issubset(data.columns):
-        raise ValueError(f"Plik musi zawierać kolumny: {required_columns}")
-
-    
-    cerebro = bt.Cerebro()
-    cerebro.broker.set_cash(initial_cash)
-
-    
-    cerebro.broker.setcommission(commission=0.001)  # 0.1% prowizji
-    cerebro.broker.set_slippage_perc(0.002)         # 0.2% poślizgu
-
-    
-    data_feed = bt.feeds.PandasData(dataname=data)
-    cerebro.adddata(data_feed)
-
-    
-    cerebro.addstrategy(RSI_SMAStrategy)
-
-    
-    print(f"[INFO] Kapitał początkowy: {cerebro.broker.getvalue():.2f}")
-    result = cerebro.run()
-    print(f"[INFO] Końcowa wartość portfela: {cerebro.broker.getvalue():.2f}")
-
-    
-    cerebro.plot()
-
-
-
-if __name__ == "__main__":
-    try:
-        # Podaj nazwę pliku Excel
-        datafile = "market_data2.xlsx"
-        # Uruchom backtest
-        run_backtest(datafile)
-    except Exception as e:
-        print(f"[ERROR] {e}")
+cerebro.run()
+cerebro.plot()
